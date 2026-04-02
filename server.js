@@ -24,6 +24,7 @@ const MAX_API          = 'https://platform-api.max.ru';
 const POST_TITLE_MAX_LEN = 80;
 const COMMENT_MAX_LEN    = 1000;
 const DUPLICATE_KEY_CODE = '23505'; // Postgres unique_violation
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 if (!ADMIN_USER_ID) {
   console.warn('[CONFIG] ADMIN_USER_ID не задан — функции администратора отключены');
@@ -243,7 +244,7 @@ app.get('/api/post/:messageId/comments', auth, async (req, res) => {
 
     const { data, error } = await supabase
       .from('comments')
-      .select('id, first_name, username, text, created_at, user_id')
+      .select('id, first_name, username, text, created_at, user_id, reply_to_id, reply_to:reply_to_id (id, first_name, text)')
       .eq('post_id', post.id)
       .eq('is_deleted', false)
       .order('created_at', { ascending: true });
@@ -260,9 +261,12 @@ app.get('/api/post/:messageId/comments', auth, async (req, res) => {
 // API: Добавить комментарий
 // =============================================
 app.post('/api/post/:messageId/comments', auth, commentLimiter, async (req, res) => {
-  const { text } = req.body;
+  const { text, reply_to_id = null } = req.body;
   if (!text || text.trim().length < 1) return res.status(400).json({ error: 'Empty text' });
   if (text.length > COMMENT_MAX_LEN) return res.status(400).json({ error: 'Too long' });
+  if (reply_to_id && !UUID_RE.test(reply_to_id)) {
+    return res.status(400).json({ error: 'Некорректный reply_to_id' });
+  }
 
   try {
     const { data: post } = await supabase
@@ -273,6 +277,28 @@ app.post('/api/post/:messageId/comments', auth, commentLimiter, async (req, res)
 
     if (!post) return res.status(404).json({ error: 'Post not found' });
 
+    // Проверяем бан
+    const { data: banRow } = await supabase
+      .from('banned_users')
+      .select('user_id')
+      .eq('user_id', req.maxUser.id)
+      .maybeSingle();
+    if (banRow) return res.status(403).json({ error: 'Вы заблокированы' });
+
+    // Валидация reply_to_id
+    if (reply_to_id) {
+      const { data: parent } = await supabase
+        .from('comments')
+        .select('id, post_id')
+        .eq('id', reply_to_id)
+        .eq('is_deleted', false)
+        .maybeSingle();
+      if (!parent) return res.status(400).json({ error: 'Комментарий для ответа не найден' });
+      if (String(parent.post_id) !== String(post.id)) {
+        return res.status(400).json({ error: 'Нельзя отвечать на комментарий из другого поста' });
+      }
+    }
+
     const { data: comment, error } = await supabase
       .from('comments')
       .insert({
@@ -282,6 +308,7 @@ app.post('/api/post/:messageId/comments', auth, commentLimiter, async (req, res)
         first_name: req.maxUser.first_name || 'Пользователь',
         last_name: req.maxUser.last_name || null,
         text: text.trim(),
+        reply_to_id: reply_to_id || null,
       })
       .select()
       .single();
@@ -374,6 +401,65 @@ app.post('/api/admin/register-post', auth, async (req, res) => {
     res.json(data);
   } catch (err) {
     console.error('POST /api/admin/register-post', err);
+    res.status(500).json({ error: 'Internal error' });
+  }
+});
+
+// =============================================
+// API: Заблокировать пользователя (только admin)
+// =============================================
+app.post('/api/admin/ban/:userId', auth, async (req, res) => {
+  if (!req.isAdmin) return res.status(403).json({ error: 'Forbidden' });
+
+  const targetId = parseInt(req.params.userId, 10);
+  if (!targetId || String(targetId) !== req.params.userId) {
+    return res.status(400).json({ error: 'Invalid userId' });
+  }
+  if (ADMIN_USER_ID && String(targetId) === String(ADMIN_USER_ID)) {
+    return res.status(400).json({ error: 'Нельзя заблокировать администратора' });
+  }
+
+  const { reason } = req.body;
+
+  try {
+    const { error } = await supabase
+      .from('banned_users')
+      .insert({ user_id: targetId, banned_by: req.maxUser.id, reason: reason || null });
+
+    if (error) {
+      if (error.code === DUPLICATE_KEY_CODE) {
+        return res.status(409).json({ error: 'Пользователь уже заблокирован' });
+      }
+      return res.status(500).json({ error: 'Internal error' });
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('POST /api/admin/ban/:userId', err);
+    res.status(500).json({ error: 'Internal error' });
+  }
+});
+
+// =============================================
+// API: Разблокировать пользователя (только admin)
+// =============================================
+app.delete('/api/admin/ban/:userId', auth, async (req, res) => {
+  if (!req.isAdmin) return res.status(403).json({ error: 'Forbidden' });
+
+  const targetId = parseInt(req.params.userId, 10);
+  if (!targetId || String(targetId) !== req.params.userId) {
+    return res.status(400).json({ error: 'Invalid userId' });
+  }
+
+  try {
+    const { error } = await supabase
+      .from('banned_users')
+      .delete()
+      .eq('user_id', targetId);
+
+    if (error) return res.status(500).json({ error: 'Internal error' });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('DELETE /api/admin/ban/:userId', err);
     res.status(500).json({ error: 'Internal error' });
   }
 });

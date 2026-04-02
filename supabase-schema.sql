@@ -40,3 +40,26 @@ CREATE POLICY "read posts" ON channel_posts FOR SELECT USING (true);
 CREATE POLICY "read comments" ON comments FOR SELECT USING (NOT is_deleted);
 
 -- Service role (backend) обходит RLS автоматически
+
+-- =============================================
+-- REPLIES: ответы на комментарии
+-- =============================================
+ALTER TABLE comments
+  ADD COLUMN IF NOT EXISTS reply_to_id UUID REFERENCES comments(id) ON DELETE SET NULL;
+
+CREATE INDEX IF NOT EXISTS idx_comments_reply_to_id ON comments(reply_to_id);
+
+-- =============================================
+-- BAN: таблица заблокированных пользователей
+-- =============================================
+CREATE TABLE IF NOT EXISTS banned_users (
+  id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id    BIGINT NOT NULL UNIQUE,
+  banned_by  BIGINT NOT NULL,
+  reason     TEXT,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+
+ALTER TABLE banned_users ENABLE ROW LEVEL SECURITY;
+-- Только service_role (backend) имеет доступ — публичный доступ закрыт
+CREATE POLICY "no public access" ON banned_users USING (false);

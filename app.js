@@ -4,10 +4,20 @@ let currentUser = null;
 let isAdmin     = false;
 let postId      = null;   // message_id поста из канала
 let isSending   = false;
+let replyingTo  = null;   // { id, first_name, text } | null
+
+// ─── DOM-ссылки (кешируем после DOMContentLoaded) ───
+let replyBar, replyBarName, replyBarText;
 
 // ─── INIT ────────────────────────────────────
 window.addEventListener('DOMContentLoaded', async () => {
   window.WebApp?.ready();
+
+  replyBar     = document.getElementById('replyBar');
+  replyBarName = document.getElementById('replyBarName');
+  replyBarText = document.getElementById('replyBarText');
+
+  document.getElementById('replyBarClose').addEventListener('click', clearReplyingTo);
 
   initData    = window.WebApp?.initData || '';
   currentUser = window.WebApp?.initDataUnsafe?.user || { id: 0, first_name: 'Пользователь' };
@@ -128,21 +138,39 @@ function makeDateDivider(date) {
 
 function buildBubble(c, isMine) {
   const canDelete = isMine || isAdmin;
-  const initials = (c.first_name || '?').charAt(0).toUpperCase();
-  const time = new Date(c.created_at).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+  const canBan    = isAdmin && !isMine;
+  const initials  = (c.first_name || '?').charAt(0).toUpperCase();
+  const time      = new Date(c.created_at).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
 
   const row = document.createElement('div');
   row.className = `msg-row ${isMine ? 'mine' : 'other'}`;
   row.dataset.id = c.id;
 
-  // data-comment-id вместо inline onclick — защита от XSS через c.id
+  // Блок цитаты для ответов
+  const quoteHTML = c.reply_to
+    ? `<div class="reply-quote">
+         <span class="reply-quote-author">${esc(c.reply_to.first_name)}</span>
+         <span class="reply-quote-text">${esc(truncate(c.reply_to.text, 60))}</span>
+       </div>`
+    : '';
+
+  // Кнопки действий через data-атрибуты — без inline onclick
+  const replyBtn  = `<button class="bubble-reply" data-reply-id="${esc(c.id)}" data-reply-name="${esc(c.first_name)}" data-reply-text="${esc(c.text)}" title="Ответить">↩</button>`;
+  const deleteBtn = canDelete
+    ? `<button class="bubble-delete" data-comment-id="${esc(c.id)}" title="Удалить">✕</button>`
+    : '';
+  const banBtn    = canBan
+    ? `<button class="bubble-ban" data-ban-id="${esc(String(c.user_id))}" data-ban-name="${esc(c.first_name)}" title="Заблокировать">🚫</button>`
+    : '';
+
   row.innerHTML = `
     <div class="avatar" title="${esc(c.first_name)}">${initials}</div>
     <div class="bubble">
       ${!isMine ? `<div class="bubble-author">${esc(c.first_name)}${c.username ? ' @' + esc(c.username) : ''}</div>` : ''}
+      ${quoteHTML}
       <div class="bubble-text">${esc(c.text)}</div>
       <div class="bubble-time">${time}</div>
-      ${canDelete ? `<button class="bubble-delete" data-comment-id="${esc(c.id)}" title="Удалить">✕</button>` : ''}
+      <div class="bubble-actions">${replyBtn}${deleteBtn}${banBtn}</div>
     </div>
   `;
   return row;
@@ -152,10 +180,19 @@ function buildBubble(c, isMine) {
 const inputField = document.getElementById('inputField');
 const sendBtn    = document.getElementById('sendBtn');
 
-// Делегированный обработчик удаления — безопасная альтернатива inline onclick
+// Делегированный обработчик — reply, delete, ban
 document.getElementById('messagesList').addEventListener('click', (e) => {
-  const btn = e.target.closest('[data-comment-id]');
-  if (btn) deleteComment(btn.dataset.commentId, btn);
+  const delBtn = e.target.closest('[data-comment-id]');
+  if (delBtn) { deleteComment(delBtn.dataset.commentId, delBtn); return; }
+
+  const repBtn = e.target.closest('[data-reply-id]');
+  if (repBtn) {
+    setReplyingTo({ id: repBtn.dataset.replyId, first_name: repBtn.dataset.replyName, text: repBtn.dataset.replyText });
+    return;
+  }
+
+  const banBtn = e.target.closest('[data-ban-id]');
+  if (banBtn) { banUser(banBtn.dataset.banId, banBtn.dataset.banName); return; }
 });
 
 inputField.addEventListener('input', function () {
@@ -179,10 +216,16 @@ async function sendComment() {
   sendBtn.disabled = true;
 
   try {
+    const body = { text };
+    if (replyingTo) body.reply_to_id = replyingTo.id;
+
     const comment = await api(`/api/post/${postId}/comments`, {
       method: 'POST',
-      body: { text },
+      body,
     });
+
+    // Сервер возвращает строку без join — добавляем reply_to из локального стейта
+    if (replyingTo) comment.reply_to = { ...replyingTo };
 
     const list = document.getElementById('messagesList');
 
@@ -191,6 +234,7 @@ async function sendComment() {
 
     ensureDateDivider(list);
     list.appendChild(buildBubble(comment, true));
+    clearReplyingTo();
 
     inputField.value = '';
     inputField.style.height = 'auto';
@@ -202,7 +246,12 @@ async function sendComment() {
     scrollToBottom();
 
   } catch (err) {
-    showToast('❌ ' + err.message);
+    if (err.message === 'Вы заблокированы') {
+      showError('🚫 Вы заблокированы и не можете оставлять комментарии.');
+    } else {
+      if (err.message.includes('не найден')) clearReplyingTo();
+      showToast('❌ ' + err.message);
+    }
   } finally {
     isSending = false;
     sendBtn.disabled = !inputField.value.trim();
@@ -233,6 +282,31 @@ async function deleteComment(id, btn) {
   } catch (err) {
     showToast('❌ ' + err.message);
     btn.textContent = '✕';
+  }
+}
+
+// ─── ОТВЕТ НА КОММЕНТАРИЙ ────────────────────
+function setReplyingTo(comment) {
+  replyingTo = comment;
+  replyBarName.textContent = comment.first_name;
+  replyBarText.textContent = truncate(comment.text, 40);
+  replyBar.classList.add('show');
+  inputField.focus();
+}
+
+function clearReplyingTo() {
+  replyingTo = null;
+  replyBar.classList.remove('show');
+}
+
+// ─── БАН ПОЛЬЗОВАТЕЛЯ (admin) ────────────────
+async function banUser(userId, name) {
+  if (!confirm(`Заблокировать пользователя ${name}?`)) return;
+  try {
+    await api(`/api/admin/ban/${userId}`, { method: 'POST', body: {} });
+    showToast('Пользователь заблокирован');
+  } catch (err) {
+    showToast('❌ ' + err.message);
   }
 }
 

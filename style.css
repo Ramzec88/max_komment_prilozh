@@ -201,23 +201,70 @@ body {
   font-weight: 600;
 }
 
-/* Кнопка удаления (свои / admin) */
-.bubble-delete {
+/* ─── КНОПКИ ДЕЙСТВИЙ НА ПУЗЫРЕ ─── */
+.bubble-actions {
   position: absolute;
   top: 4px; right: 4px;
-  width: 18px; height: 18px;
+  display: none;
+  gap: 3px;
+  align-items: center;
+}
+.bubble:hover .bubble-actions { display: flex; }
+
+.bubble-reply,
+.bubble-delete,
+.bubble-ban {
+  width: 20px; height: 20px;
   border-radius: 50%;
   border: none;
   background: rgba(0,0,0,.15);
   color: white;
-  font-size: 10px;
+  font-size: 11px;
   cursor: pointer;
-  display: none;
+  display: flex;
   align-items: center;
   justify-content: center;
   transition: background 0.15s;
+  padding: 0;
+  flex-shrink: 0;
 }
-.bubble:hover .bubble-delete { display: flex; }
+.bubble-reply:hover  { background: rgba(0,0,0,.28); }
+.bubble-delete:hover { background: rgba(180,0,0,.45); }
+.bubble-ban:hover    { background: rgba(180,0,0,.45); }
+
+/* ─── ЦИТАТА ОТВЕТА (внутри пузыря) ─── */
+.reply-quote {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 5px 8px;
+  margin-bottom: 6px;
+  border-radius: var(--r-sm);
+  border-left: 3px solid rgba(255,255,255,.5);
+  background: rgba(0,0,0,.08);
+  font-size: 12px;
+  line-height: 1.3;
+  overflow: hidden;
+}
+.msg-row.other .reply-quote {
+  border-left-color: var(--bear-l);
+  background: var(--surface-2);
+}
+.reply-quote-author {
+  font-family: 'Nunito', sans-serif;
+  font-weight: 800;
+  opacity: 0.9;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.reply-quote-text {
+  opacity: 0.75;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: block;
+}
 
 /* ─── ПУСТОЕ СОСТОЯНИЕ ─── */
 .empty-state {
@@ -331,6 +378,68 @@ body {
   display: none;
 }
 .error-bar.show { display: block; }
+
+/* ─── BAR ОТВЕТА ─── */
+.reply-bar {
+  background: var(--surface-2);
+  border-top: 1.5px solid var(--border);
+  padding: 7px 14px;
+  display: none;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  animation: slideUp 0.15s ease;
+}
+.reply-bar.show { display: flex; }
+
+@keyframes slideUp {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.reply-bar-icon {
+  font-size: 16px;
+  color: var(--bear);
+  flex-shrink: 0;
+}
+
+.reply-bar-content {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.reply-bar-name {
+  font-family: 'Nunito', sans-serif;
+  font-weight: 800;
+  font-size: 12px;
+  color: var(--bear);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.reply-bar-text {
+  font-size: 12px;
+  color: var(--text-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.reply-bar-close {
+  background: none;
+  border: none;
+  color: var(--text-3);
+  font-size: 20px;
+  cursor: pointer;
+  line-height: 1;
+  padding: 0 2px;
+  flex-shrink: 0;
+}
+.reply-bar-close:hover { color: var(--text); }
 
 /* ─── ТОСТ ─── */
 .toast {
