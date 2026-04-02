@@ -1,24 +1,33 @@
 // =============================================
 // MAX Comments System — server.js
 // Бот + REST API для мини-приложения комментариев
-// Роман: добавь этот файл к своему Railway проекту
 // =============================================
 
 import express from 'express';
 import cors from 'cors';
 import crypto from 'crypto';
 import { createClient } from '@supabase/supabase-js';
-import Bot from '@maxhub/max-bot-api'; // твоя библиотека
+import rateLimit from 'express-rate-limit';
+import Bot from '@maxhub/max-bot-api';
 
 // ─── Конфиг (из env Railway) ────────────────
 const BOT_TOKEN        = process.env.MAX_BOT_TOKEN;
 const SUPABASE_URL     = process.env.SUPABASE_URL;
 const SUPABASE_KEY     = process.env.SUPABASE_SERVICE_KEY; // service_role
 const ADMIN_USER_ID    = process.env.ADMIN_USER_ID;
-const MINIAPP_URL      = process.env.MINIAPP_URL;   // https://comments.mishka-max.ru
-const CHANNEL_ID       = process.env.CHANNEL_ID;    // ID твоего канала в MAX
+const MINIAPP_URL      = process.env.MINIAPP_URL;
+const CHANNEL_ID       = process.env.CHANNEL_ID;
 const PORT             = process.env.PORT || 3000;
 const MAX_API          = 'https://platform-api.max.ru';
+
+// ─── Именованные константы ───────────────────
+const POST_TITLE_MAX_LEN = 80;
+const COMMENT_MAX_LEN    = 1000;
+const DUPLICATE_KEY_CODE = '23505'; // Postgres unique_violation
+
+if (!ADMIN_USER_ID) {
+  console.warn('[CONFIG] ADMIN_USER_ID не задан — функции администратора отключены');
+}
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -27,23 +36,50 @@ const bot = new Bot(BOT_TOKEN);
 
 // ─── Express ────────────────────────────────
 const app = express();
-app.use(cors({ origin: '*' }));
+
+// CORS: разрешаем только MINIAPP_URL и значения из ALLOWED_ORIGINS
+const allowedOrigins = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(',').map(s => s.trim())
+  : (MINIAPP_URL ? [MINIAPP_URL] : []);
+
+app.use(cors({
+  origin: (origin, cb) => {
+    // Разрешаем server-to-server вызовы (без origin) и явно заданные домены
+    if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
+    cb(new Error('CORS: origin not allowed'));
+  },
+}));
+
 app.use(express.json());
+
+// Rate limiter: не более 10 комментариев в минуту на пользователя
+const commentLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  keyGenerator: (req) => String(req.maxUser?.id || req.ip),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Слишком много комментариев, подождите немного' },
+});
 
 // =============================================
 // ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 // =============================================
 
-// MAX Bot API: прямой HTTP вызов
+function maxHeaders() {
+  return {
+    'Authorization': BOT_TOKEN,
+    'Content-Type': 'application/json',
+  };
+}
+
+// MAX Bot API: прямой HTTP вызов (POST)
 async function maxApi(method, body, queryParams = {}) {
   const url = new URL(`${MAX_API}/${method}`);
   Object.entries(queryParams).forEach(([k, v]) => url.searchParams.set(k, v));
   const res = await fetch(url.toString(), {
     method: 'POST',
-    headers: {
-      'Authorization': BOT_TOKEN,
-      'Content-Type': 'application/json',
-    },
+    headers: maxHeaders(),
     body: JSON.stringify(body),
   });
   return res.json();
@@ -55,15 +91,11 @@ async function updateCommentButton(messageId, count) {
     ? '💬 Комментарии'
     : `💬 Комментарии (${count})`;
 
-  // Диплинк передаёт message_id как start_param
   const deeplink = `${MINIAPP_URL}?startapp=post_${messageId}`;
 
   await fetch(`${MAX_API}/messages?message_id=${messageId}`, {
     method: 'PUT',
-    headers: {
-      'Authorization': BOT_TOKEN,
-      'Content-Type': 'application/json',
-    },
+    headers: maxHeaders(),
     body: JSON.stringify({
       attachments: [
         {
@@ -72,7 +104,7 @@ async function updateCommentButton(messageId, count) {
             buttons: [
               [
                 {
-                  type: 'open_app',   // Открывает мини-приложение
+                  type: 'open_app',
                   text: label,
                   url: deeplink,
                   intent: 'default',
@@ -84,6 +116,12 @@ async function updateCommentButton(messageId, count) {
       ]
     }),
   });
+}
+
+// HMAC-SHA256 верификация подписи initData
+function computeHmacHex(token, checkString) {
+  const secretKey = crypto.createHmac('sha256', 'WebAppData').update(token).digest();
+  return crypto.createHmac('sha256', secretKey).update(checkString).digest('hex');
 }
 
 // Валидация initData от MAX Bridge
@@ -99,16 +137,7 @@ function validateInitData(initData) {
       .map(([k, v]) => `${k}=${v}`)
       .join('\n');
 
-    const secretKey = crypto
-      .createHmac('sha256', 'WebAppData')
-      .update(BOT_TOKEN)
-      .digest();
-    const expected = crypto
-      .createHmac('sha256', secretKey)
-      .update(checkString)
-      .digest('hex');
-
-    if (expected !== hash) return null;
+    if (computeHmacHex(BOT_TOKEN, checkString) !== hash) return null;
 
     const userStr = params.get('user');
     const startParam = params.get('start_param') || '';
@@ -121,7 +150,6 @@ function validateInitData(initData) {
 
 // Middleware авторизации
 function auth(req, res, next) {
-  // В dev-режиме без initData — пропускаем
   if (process.env.NODE_ENV === 'development') {
     req.maxUser = { id: 0, first_name: 'Dev', username: 'dev' };
     req.isAdmin = true;
@@ -137,30 +165,27 @@ function auth(req, res, next) {
 
   req.maxUser = parsed.user;
   req.startParam = parsed.startParam;
-  req.isAdmin = String(parsed.user.id) === String(ADMIN_USER_ID);
+  req.isAdmin = ADMIN_USER_ID
+    ? String(parsed.user.id) === String(ADMIN_USER_ID)
+    : false;
   next();
 }
 
 // =============================================
 // BOT: Слушаем публикации в канале
 // =============================================
-// Когда ты публикуешь пост в канал — бот получает событие message_created
-// и сохраняет пост + добавляет кнопку "Комментарии"
 
 bot.onMessage(async (ctx) => {
   const msg = ctx.message;
 
-  // Обрабатываем только сообщения из твоего канала
   if (String(msg.recipient?.chatId) !== String(CHANNEL_ID)) return;
 
-  // Проверяем что это пост (от бота или от тебя как администратора)
   const messageId = msg.id;
   const text = msg.body?.text || '';
-  const title = text.slice(0, 80).replace(/\n/g, ' ');
+  const title = text.slice(0, POST_TITLE_MAX_LEN).replace(/\n/g, ' ');
 
   try {
-    // 1. Регистрируем пост в Supabase
-    const { data: post, error } = await supabase
+    const { error } = await supabase
       .from('channel_posts')
       .insert({
         message_id: String(messageId),
@@ -171,12 +196,11 @@ bot.onMessage(async (ctx) => {
       .select()
       .single();
 
-    if (error && error.code !== '23505') { // 23505 = unique_violation (дубль)
+    if (error && error.code !== DUPLICATE_KEY_CODE) {
       console.error('Supabase insert error:', error);
       return;
     }
 
-    // 2. Добавляем кнопку "Комментарии" под постом
     await updateCommentButton(messageId, 0);
     console.log(`✅ Пост зарегистрирован: ${messageId} — "${title}"`);
 
@@ -188,157 +212,170 @@ bot.onMessage(async (ctx) => {
 // =============================================
 // API: Получить пост по message_id
 // =============================================
-// GET /api/post/:messageId
 app.get('/api/post/:messageId', auth, async (req, res) => {
-  const { data, error } = await supabase
-    .from('channel_posts')
-    .select('id, message_id, title, comment_count, created_at')
-    .eq('message_id', req.params.messageId)
-    .single();
+  try {
+    const { data, error } = await supabase
+      .from('channel_posts')
+      .select('id, message_id, title, comment_count, created_at')
+      .eq('message_id', req.params.messageId)
+      .single();
 
-  if (error) return res.status(404).json({ error: 'Post not found' });
-  res.json(data);
+    if (error || !data) return res.status(404).json({ error: 'Post not found' });
+    res.json(data);
+  } catch (err) {
+    console.error('GET /api/post/:messageId', err);
+    res.status(500).json({ error: 'Internal error' });
+  }
 });
 
 // =============================================
 // API: Получить комментарии поста
 // =============================================
-// GET /api/post/:messageId/comments
 app.get('/api/post/:messageId/comments', auth, async (req, res) => {
-  // Получаем post UUID по message_id
-  const { data: post } = await supabase
-    .from('channel_posts')
-    .select('id')
-    .eq('message_id', req.params.messageId)
-    .single();
+  try {
+    const { data: post } = await supabase
+      .from('channel_posts')
+      .select('id')
+      .eq('message_id', req.params.messageId)
+      .single();
 
-  if (!post) return res.status(404).json({ error: 'Post not found' });
+    if (!post) return res.status(404).json({ error: 'Post not found' });
 
-  const { data, error } = await supabase
-    .from('comments')
-    .select('id, first_name, username, text, created_at, user_id')
-    .eq('post_id', post.id)
-    .eq('is_deleted', false)
-    .order('created_at', { ascending: true });
+    const { data, error } = await supabase
+      .from('comments')
+      .select('id, first_name, username, text, created_at, user_id')
+      .eq('post_id', post.id)
+      .eq('is_deleted', false)
+      .order('created_at', { ascending: true });
 
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
+    if (error) return res.status(500).json({ error: 'Internal error' });
+    res.json(data);
+  } catch (err) {
+    console.error('GET /api/post/:messageId/comments', err);
+    res.status(500).json({ error: 'Internal error' });
+  }
 });
 
 // =============================================
 // API: Добавить комментарий
 // =============================================
-// POST /api/post/:messageId/comments
-app.post('/api/post/:messageId/comments', auth, async (req, res) => {
+app.post('/api/post/:messageId/comments', auth, commentLimiter, async (req, res) => {
   const { text } = req.body;
   if (!text || text.trim().length < 1) return res.status(400).json({ error: 'Empty text' });
-  if (text.length > 1000) return res.status(400).json({ error: 'Too long' });
+  if (text.length > COMMENT_MAX_LEN) return res.status(400).json({ error: 'Too long' });
 
-  // Ищем пост
-  const { data: post } = await supabase
-    .from('channel_posts')
-    .select('id, message_id, comment_count')
-    .eq('message_id', req.params.messageId)
-    .single();
+  try {
+    const { data: post } = await supabase
+      .from('channel_posts')
+      .select('id, message_id, comment_count')
+      .eq('message_id', req.params.messageId)
+      .single();
 
-  if (!post) return res.status(404).json({ error: 'Post not found' });
+    if (!post) return res.status(404).json({ error: 'Post not found' });
 
-  // Сохраняем комментарий
-  const { data: comment, error } = await supabase
-    .from('comments')
-    .insert({
-      post_id: post.id,
-      user_id: req.maxUser.id,
-      username: req.maxUser.username || null,
-      first_name: req.maxUser.first_name || 'Пользователь',
-      last_name: req.maxUser.last_name || null,
-      text: text.trim(),
-    })
-    .select()
-    .single();
+    const { data: comment, error } = await supabase
+      .from('comments')
+      .insert({
+        post_id: post.id,
+        user_id: req.maxUser.id,
+        username: req.maxUser.username || null,
+        first_name: req.maxUser.first_name || 'Пользователь',
+        last_name: req.maxUser.last_name || null,
+        text: text.trim(),
+      })
+      .select()
+      .single();
 
-  if (error) return res.status(500).json({ error: error.message });
+    if (error) return res.status(500).json({ error: 'Internal error' });
 
-  // Обновляем счётчик
-  const newCount = (post.comment_count || 0) + 1;
-  await supabase
-    .from('channel_posts')
-    .update({ comment_count: newCount })
-    .eq('id', post.id);
+    const newCount = (post.comment_count || 0) + 1;
+    await supabase
+      .from('channel_posts')
+      .update({ comment_count: newCount })
+      .eq('id', post.id);
 
-  // Обновляем кнопку под постом в канале
-  await updateCommentButton(post.message_id, newCount);
+    await updateCommentButton(post.message_id, newCount);
 
-  res.json(comment);
+    res.json(comment);
+  } catch (err) {
+    console.error('POST /api/post/:messageId/comments', err);
+    res.status(500).json({ error: 'Internal error' });
+  }
 });
 
 // =============================================
 // API: Удалить комментарий (только свой или admin)
 // =============================================
-// DELETE /api/comments/:commentId
 app.delete('/api/comments/:commentId', auth, async (req, res) => {
-  const { data: comment } = await supabase
-    .from('comments')
-    .select('id, user_id, post_id')
-    .eq('id', req.params.commentId)
-    .single();
+  try {
+    const { data: comment } = await supabase
+      .from('comments')
+      .select('id, user_id, post_id')
+      .eq('id', req.params.commentId)
+      .single();
 
-  if (!comment) return res.status(404).json({ error: 'Not found' });
+    if (!comment) return res.status(404).json({ error: 'Comment not found' });
 
-  // Только свой комментарий или admin
-  if (!req.isAdmin && String(comment.user_id) !== String(req.maxUser.id)) {
-    return res.status(403).json({ error: 'Forbidden' });
-  }
+    if (!req.isAdmin && String(comment.user_id) !== String(req.maxUser.id)) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
 
-  await supabase
-    .from('comments')
-    .update({ is_deleted: true })
-    .eq('id', req.params.commentId);
-
-  // Пересчитываем счётчик
-  const { data: post } = await supabase
-    .from('channel_posts')
-    .select('id, message_id, comment_count')
-    .eq('id', comment.post_id)
-    .single();
-
-  if (post) {
-    const newCount = Math.max(0, (post.comment_count || 1) - 1);
     await supabase
-      .from('channel_posts')
-      .update({ comment_count: newCount })
-      .eq('id', post.id);
-    await updateCommentButton(post.message_id, newCount);
-  }
+      .from('comments')
+      .update({ is_deleted: true })
+      .eq('id', req.params.commentId);
 
-  res.json({ ok: true });
+    const { data: post } = await supabase
+      .from('channel_posts')
+      .select('id, message_id, comment_count')
+      .eq('id', comment.post_id)
+      .single();
+
+    if (post) {
+      const newCount = Math.max(0, (post.comment_count || 1) - 1);
+      await supabase
+        .from('channel_posts')
+        .update({ comment_count: newCount })
+        .eq('id', post.id);
+      await updateCommentButton(post.message_id, newCount);
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('DELETE /api/comments/:commentId', err);
+    res.status(500).json({ error: 'Internal error' });
+  }
 });
 
 // =============================================
 // API: Ручная регистрация поста (если бот пропустил)
 // =============================================
-// POST /api/admin/register-post
 app.post('/api/admin/register-post', auth, async (req, res) => {
   if (!req.isAdmin) return res.status(403).json({ error: 'Forbidden' });
 
   const { message_id, title } = req.body;
   if (!message_id) return res.status(400).json({ error: 'message_id required' });
 
-  const { data, error } = await supabase
-    .from('channel_posts')
-    .upsert({
-      message_id: String(message_id),
-      chat_id: String(CHANNEL_ID),
-      title: title || 'Пост',
-      comment_count: 0,
-    }, { onConflict: 'message_id' })
-    .select()
-    .single();
+  try {
+    const { data, error } = await supabase
+      .from('channel_posts')
+      .upsert({
+        message_id: String(message_id),
+        chat_id: String(CHANNEL_ID),
+        title: title || 'Пост',
+        comment_count: 0,
+      }, { onConflict: 'message_id' })
+      .select()
+      .single();
 
-  if (error) return res.status(500).json({ error: error.message });
+    if (error) return res.status(500).json({ error: 'Internal error' });
 
-  await updateCommentButton(message_id, data.comment_count || 0);
-  res.json(data);
+    await updateCommentButton(message_id, data.comment_count || 0);
+    res.json(data);
+  } catch (err) {
+    console.error('POST /api/admin/register-post', err);
+    res.status(500).json({ error: 'Internal error' });
+  }
 });
 
 // =============================================

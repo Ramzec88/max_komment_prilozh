@@ -28,8 +28,11 @@
 max-comments/
 ├── supabase-schema.sql   ← Таблицы БД (один раз)
 ├── server.js             ← Bot + REST API (Railway)
-├── miniapp/
-│   └── index.html        ← Фронтенд чата (Vercel/GitHub Pages)
+├── package.json          ← Зависимости Node.js
+├── index.html            ← Фронтенд — разметка (Vercel/GitHub Pages)
+├── style.css             ← Стили фронтенда
+├── config.js             ← Конфиг фронтенда (API_BASE, ADMIN_ID) ← редактировать перед деплоем
+├── app.js                ← Логика фронтенда
 └── README.md
 ```
 
@@ -51,14 +54,19 @@ CHANNEL_ID=id_твоего_канала
 PORT=3000
 ```
 
-### 3. Фронтенд — замени 2 строки в index.html
+### 3. Фронтенд — замени 2 значения в config.js
 ```js
-const API_BASE = 'https://YOUR-BACKEND.railway.app';
-const ADMIN_ID = 'YOUR_MAX_USER_ID';
+const API_BASE = 'https://ВАШ-ПРОЕКТ.railway.app'; // URL Railway-сервера
+const ADMIN_ID = 'ВАШ_USER_ID_В_MAX';              // ваш user_id в MAX
 ```
-Задеплой папку `miniapp/` на Vercel:
+Задеплой все файлы фронтенда (`index.html`, `style.css`, `app.js`, `config.js`) на Vercel:
 ```bash
-cd miniapp && npx vercel deploy --prod
+npx vercel deploy --prod
+```
+
+Добавь в Railway переменную окружения для CORS:
+```env
+ALLOWED_ORIGINS=https://ваш-vercel-url.vercel.app
 ```
 
 ### 4. Подключи мини-приложение в MAX
